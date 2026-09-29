@@ -22,6 +22,20 @@ spring:
     web:
       pageable:
         max-page-size: 100
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer
+      acks: all
+      properties:
+        # Plain JSON with its own "eventType" discriminator; no Java class name header for consumers to depend on
+        spring.json.add.type.headers: false
+        # Events are notifications, not prerequisites: if the broker is unreachable, send() gives up after 1s
+        # (Kafka's default is 60s, which would stall the order request) and delivery fails after 10s, not 2min.
+        max.block.ms: 1000
+        request.timeout.ms: 5000
+        delivery.timeout.ms: 10000
   cloud:
     openfeign:
       client:
@@ -30,6 +44,11 @@ spring:
             connect-timeout: 1000
             # Backstop only: the 3s TimeLimiter below normally fires first
             read-timeout: 4000
+
+order-service:
+  kafka:
+    # All order status changes go to this one topic, keyed by orderId
+    order-events-topic: order-events
 
 eureka:
   client:

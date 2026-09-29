@@ -51,6 +51,11 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
 @SpringBootTest(properties = {
         "spring.cloud.config.enabled=false",
         "eureka.client.enabled=false",
+        // No Kafka broker here on purpose: every order in this class is placed while event publishing fails,
+        // proving the event is a notification that never fails the request (OrderEventsIntegrationTest covers
+        // the published events). A short max.block.ms keeps the failed sends quick.
+        "spring.kafka.bootstrap-servers=localhost:1",
+        "spring.kafka.producer.properties.max.block.ms=200",
         // Smaller window and shorter timeouts than production so the resilience paths run quickly
         "resilience4j.circuitbreaker.instances.productService.sliding-window-size=4",
         "resilience4j.circuitbreaker.instances.productService.minimum-number-of-calls=4",
@@ -150,6 +155,27 @@ class OrderFlowIntegrationTest {
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.status").value(409))
                 .andExpect(jsonPath("$.message").value(containsString("CANCELLED to CANCELLED")));
+    }
+
+    @Test
+    void orderAndCancelSucceedWhenKafkaIsUnreachable() throws Exception {
+        UUID product = UUID.randomUUID();
+        stubProduct(product, "Gaming Laptop", "999.99", 5);
+        stubInventoryUpdate(product);
+
+        long start = System.nanoTime();
+        String body = createOrder(singleItemOrder(product, 1))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.status").value("CONFIRMED"))
+                .andReturn().getResponse().getContentAsString();
+        mockMvc.perform(MockMvcRequestBuilders.patch("/api/orders/{id}/cancel", (String) JsonPath.read(body, "$.id")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("CANCELLED"));
+        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+
+        // 3 failed publishes, each bounded by max.block.ms, not Kafka's 60s default
+        assertThat(elapsedMillis).isLessThan(5_000);
+        assertThat(orderRepository.count()).isEqualTo(1);
     }
 
     @Test

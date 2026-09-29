@@ -9,6 +9,7 @@ against **product-service** and decrements inventory there when an order is conf
 - Registers with Eureka (`http://localhost:8761/eureka/`) and finds product-service through it (service id
   `product-service`, no hardcoded URL)
 - OpenFeign + Resilience4j (circuit breaker, retry, timeout) for every call to product-service
+- Publishes every order status change to the Kafka topic **`order-events`**
 - Port **8083**
 
 ## Prerequisites
@@ -21,6 +22,7 @@ Start these **before** order-service:
 | Eureka (service-registry) | `http://localhost:8761` | `../service-registry` |
 | **product-service** | registered in Eureka as `product-service` (port 8082) | `../product-service`. order-service calls it directly on every order. Without it, creating an order returns **503** |
 | PostgreSQL | `localhost:5434`, db `orderdb`, user/pass `orderservice`/`orderservice` | `docker compose up -d postgres` starts one with these defaults |
+| Kafka | `localhost:9092` | `docker compose up -d kafka` (single-node KRaft, no ZooKeeper). Optional: without it orders still work, and each failed event publish is logged |
 
 The database is on port **5434** with its own name and volume, so it can run next to user-service's (5432) and
 product-service's (5433).
@@ -37,6 +39,7 @@ Every setting can be overridden with an environment variable:
 | `DB_USERNAME` / `DB_PASSWORD` | `orderservice` / `orderservice` | DB credentials |
 | `CONFIG_SERVER_URL` | `http://localhost:8888` | Config Server |
 | `EUREKA_URL` | `http://localhost:8761/eureka/` | Eureka `defaultZone` |
+| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka brokers for order events |
 
 ### Resilience settings
 
@@ -76,8 +79,8 @@ Some details:
 (cd ../service-registry && mvn spring-boot:run)
 (cd ../product-service  && docker compose up -d postgres && mvn spring-boot:run)
 
-# 2. PostgreSQL for orders only
-docker compose up -d postgres
+# 2. PostgreSQL and Kafka for orders
+docker compose up -d postgres kafka
 
 # 3. order-service
 mvn spring-boot:run
@@ -89,8 +92,9 @@ Circuit breaker state: http://localhost:8083/actuator/circuitbreakers (recent ca
 
 ## Run with docker-compose
 
-This starts order-service and its PostgreSQL with one command. Config Server, Eureka and product-service must
-still be running. The container reaches Config Server and Eureka through `host.docker.internal`.
+This starts order-service, its PostgreSQL and Kafka with one command. Config Server, Eureka and product-service
+must still be running. The container reaches Config Server and Eureka through `host.docker.internal`, and Kafka
+at `kafka:29092` on the compose network. Kafka also listens on `localhost:9092` for tools on the host.
 
 ```bash
 docker compose up --build
@@ -103,7 +107,74 @@ stack, it registers as `localhost:8082`. Inside the order-service container, `lo
 so order creation returns 503. In that case run order-service with `mvn spring-boot:run` instead (or put all
 services on one Docker network).
 
-Stop with `docker compose down` (add `-v` to also delete the database volume).
+Stop with `docker compose down` (add `-v` to also delete the database and Kafka volumes).
+
+## Order events (Kafka)
+
+Every status change is published to the topic **`order-events`**. The message key is the `orderId`, so all
+events for one order go to the same partition and arrive in order. The value is plain JSON with an `eventType`
+discriminator. There is no Java type header.
+
+| `eventType` | When | `status` |
+|---|---|---|
+| `OrderCreated` | The order is saved as PENDING, before the inventory decrement call | `PENDING` |
+| `OrderConfirmed` | All stock decrements succeeded | `CONFIRMED` |
+| `OrderFailed` | A stock decrement failed | `FAILED` |
+| `OrderCancelled` | `PATCH /api/orders/{id}/cancel` succeeded | `CANCELLED` |
+
+```json
+{
+  "eventType": "OrderConfirmed",
+  "orderId": "0b6e7c1e-7d0f-4a57-9a53-7f3f2f0f5c11",
+  "userId": "3f1d2a9e-5b8c-4c3e-9f7a-1a2b3c4d5e6f",
+  "status": "CONFIRMED",
+  "totalAmount": 1999.98,
+  "items": [{"productId": "5f0c7a3e-2b1d-4e8f-a9c6-0d1e2f3a4b5c", "quantity": 2}],
+  "timestamp": "2026-09-29T10:15:30.123456Z"
+}
+```
+
+Some details:
+
+- **Published after the DB commit.** Events are sent only once the change is stored, so a rejected or rolled-back
+  change (e.g. a 409 cancel) never produces an event. Orders rejected before being saved (409 stock, 404, 503)
+  produce no events at all.
+- **Postgres is the source of truth; the event is a notification.** If Kafka is unreachable, the failure is
+  logged (`Could not publish OrderCreated for order ...`) and the request still succeeds with the same response.
+  `send()` blocks for at most `max.block.ms` = 1 s when the broker is down (Kafka's default is 60 s), and a
+  buffered event that can't be delivered fails after 10 s (`delivery.timeout.ms`). Both are set in
+  `application.yml`. While Kafka is down, an order request can take up to about 1 s longer per event.
+- An event lost this way is not re-sent. Guaranteed delivery would need a transactional outbox (see limitations).
+- The topic is auto-created on first publish (3 partitions in the compose broker).
+
+### Verify events are published
+
+With Kafka running (`docker compose up -d kafka`), watch the topic from inside the Kafka container, printing keys:
+
+```bash
+docker exec -it order-service-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic order-events --from-beginning \
+  --formatter-property print.key=true --formatter-property print.partition=true \
+  --formatter-property key.separator=' | '
+```
+
+Or from the host with [kcat](https://github.com/edenhill/kcat):
+
+```bash
+kcat -b localhost:9092 -t order-events -C -f 'partition %p | key %k | %s\n'
+```
+
+Then place and cancel an order (see the curl flow below). You should see, all with the same key and partition:
+
+```
+Partition:2 | <orderId> | {"eventType":"OrderCreated","orderId":"<orderId>",...,"status":"PENDING",...}
+Partition:2 | <orderId> | {"eventType":"OrderConfirmed","orderId":"<orderId>",...,"status":"CONFIRMED",...}
+Partition:2 | <orderId> | {"eventType":"OrderCancelled","orderId":"<orderId>",...,"status":"CANCELLED",...}
+```
+
+To see the "Kafka down doesn't break orders" behaviour, run `docker compose stop kafka` and create an order. You
+still get a 201. The order-service log shows `Could not publish ...`, either right away or, if the producer had
+already fetched the topic's metadata, once the 10 s delivery timeout expires.
 
 ## API
 
@@ -228,6 +299,14 @@ mvn clean package   # unit + integration tests (Docker required)
   - slow product-service → 503 on timeout, not a hang
   - inventory decrement failure → order `FAILED`, not retried
   - unknown product → 404 without affecting the breaker; validation → 400
+  - Kafka is deliberately unreachable in this class, so every flow above also proves that a failed event publish
+    never fails the request. One test also checks the extra latency stays bounded.
+- `OrderEventsIntegrationTest`: the same setup plus an embedded Kafka broker (`@EmbeddedKafka`, no real broker).
+  Consumes `order-events` and checks the event types, full payload (items reduced to productId + quantity), key =
+  orderId and same partition for:
+  - creation + confirmation (`OrderCreated` → `OrderConfirmed`)
+  - cancellation (`OrderCancelled`; the rejected second cancel publishes nothing)
+  - decrement failure (`OrderCreated` → `OrderFailed`)
 
 ## Known limitations / next steps
 
@@ -239,4 +318,7 @@ mvn clean package   # unit + integration tests (Docker required)
   endpoint, or a reservation/saga flow.
 - Between the stock check and the decrement, another order can take the stock. product-service's 409 on the
   decrement catches this, and the order ends `FAILED` rather than overselling.
+- **Order events are at-most-once.** An event whose publish fails, or that is still in memory when the process
+  dies, is lost; the order in Postgres is still correct. For guaranteed delivery, write events to an outbox table
+  in the same transaction as the order and relay them to Kafka.
 - The schema is managed by `ddl-auto=update` until migrations are introduced.
