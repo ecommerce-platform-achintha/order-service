@@ -38,8 +38,11 @@ public class OrderService {
      * across the remote calls, and the PENDING row exists before stock is touched.
      *
      * <p>Publishes OrderCreated once the PENDING order is saved, then OrderConfirmed or OrderFailed.
+     *
+     * @param callerUserIdHeader the incoming X-User-Id, forwarded on the inventory calls because product-service
+     *                           requires it on writes
      */
-    public OrderResponse create(CreateOrderRequest request) {
+    public OrderResponse create(CreateOrderRequest request, String callerUserIdHeader) {
         Order order = new Order(request.userId());
         for (Map.Entry<UUID, Integer> line : mergeQuantities(request.items()).entrySet()) {
             ProductResponse product = productService.getProduct(line.getKey());
@@ -52,8 +55,8 @@ public class OrderService {
         order = orderRepository.save(order);
         events.publishEvent(OrderEvent.of(OrderEventType.ORDER_CREATED, order));
 
-        boolean reserved = reserveStock(order);
-        return complete(order.getId(), order.getItems(), reserved);
+        boolean reserved = reserveStock(order, callerUserIdHeader);
+        return complete(order.getId(), order.getItems(), reserved, callerUserIdHeader);
     }
 
     @Transactional(readOnly = true)
@@ -87,16 +90,16 @@ public class OrderService {
      * Decrements stock for every item. If one fails, the decrements already applied are put back so a FAILED order
      * doesn't keep stock out of circulation.
      */
-    private boolean reserveStock(Order order) {
+    private boolean reserveStock(Order order, String callerUserIdHeader) {
         List<OrderItem> decremented = new ArrayList<>();
         for (OrderItem item : order.getItems()) {
             try {
-                productService.adjustInventory(item.getProductId(), -item.getQuantity());
+                productService.adjustInventory(item.getProductId(), -item.getQuantity(), callerUserIdHeader);
                 decremented.add(item);
             } catch (RuntimeException e) {
                 log.warn("Inventory decrement failed for order {} product {}: {}", order.getId(),
                         item.getProductId(), e.getMessage());
-                releaseStock(order.getId(), decremented);
+                releaseStock(order.getId(), decremented, callerUserIdHeader);
                 return false;
             }
         }
@@ -104,10 +107,10 @@ public class OrderService {
     }
 
     /** Best effort: a failure here is logged for manual reconciliation rather than failing the request. */
-    private void releaseStock(UUID orderId, List<OrderItem> items) {
+    private void releaseStock(UUID orderId, List<OrderItem> items, String callerUserIdHeader) {
         for (OrderItem item : items) {
             try {
-                productService.adjustInventory(item.getProductId(), item.getQuantity());
+                productService.adjustInventory(item.getProductId(), item.getQuantity(), callerUserIdHeader);
             } catch (RuntimeException e) {
                 log.error("Could not restock {} x product {} for order {}; needs manual reconciliation",
                         item.getQuantity(), item.getProductId(), orderId, e);
@@ -116,7 +119,8 @@ public class OrderService {
     }
 
     /** PENDING -> CONFIRMED/FAILED, unless the order was cancelled while the decrement was in flight. */
-    private OrderResponse complete(UUID orderId, List<OrderItem> items, boolean stockReserved) {
+    private OrderResponse complete(UUID orderId, List<OrderItem> items, boolean stockReserved,
+                                   String callerUserIdHeader) {
         boolean cancelledMeanwhile;
         try {
             cancelledMeanwhile = Boolean.TRUE.equals(transactionTemplate.execute(status -> {
@@ -138,7 +142,7 @@ public class OrderService {
             cancelledMeanwhile = true; // a concurrent cancel committed first
         }
         if (cancelledMeanwhile && stockReserved) {
-            releaseStock(orderId, items);
+            releaseStock(orderId, items, callerUserIdHeader);
         }
         return transactionTemplate.execute(status -> OrderResponse.from(find(orderId)));
     }

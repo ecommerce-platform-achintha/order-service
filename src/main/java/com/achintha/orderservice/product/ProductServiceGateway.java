@@ -70,11 +70,15 @@ public class ProductServiceGateway {
         });
     }
 
-    /** Adds {@code delta} (negative to take stock out) to the product's available quantity. */
-    public InventoryResponse adjustInventory(UUID productId, int delta) {
+    /**
+     * Adds {@code delta} (negative to take stock out) to the product's available quantity, on behalf of the user in
+     * {@code userIdHeader} (the X-User-Id the Gateway set on the incoming request). Passed explicitly because the
+     * Feign call runs on another thread, where the incoming request isn't available.
+     */
+    public InventoryResponse adjustInventory(UUID productId, int delta, String userIdHeader) {
         return call(inventoryRetry, "adjust inventory of product " + productId, () -> {
             try {
-                return client.adjustInventory(productId, new AdjustInventoryRequest(delta));
+                return client.adjustInventory(productId, userIdHeader, new AdjustInventoryRequest(delta));
             } catch (FeignException.NotFound e) {
                 throw new NotFoundException("Product not found: " + productId);
             } catch (FeignException.Conflict e) {

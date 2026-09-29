@@ -1,6 +1,7 @@
 package com.achintha.orderservice.order;
 
 import com.achintha.orderservice.common.PageResponse;
+import com.achintha.orderservice.security.GatewayUserHeaderFilter;
 import io.swagger.v3.oas.annotations.Operation;
 import jakarta.validation.Valid;
 import java.util.UUID;
@@ -15,12 +16,13 @@ import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
-// No auth here yet: access control will be enforced by the API Gateway.
+// Writes require the Gateway's X-User-Id header (see GatewayUserHeaderFilter); reads are public.
 @RestController
 @RequestMapping("/api/orders")
 @RequiredArgsConstructor
@@ -33,8 +35,9 @@ public class OrderController {
     @Operation(summary = "Place an order; returns it as CONFIRMED, or FAILED if the inventory update failed",
             description = "409 if a product doesn't have enough stock, 404 if a product doesn't exist, "
                     + "503 if product-service is unavailable (nothing is saved in the 409/404/503 cases)")
-    public OrderResponse create(@Valid @RequestBody CreateOrderRequest request) {
-        return orderService.create(request);
+    public OrderResponse create(@RequestHeader(GatewayUserHeaderFilter.USER_ID_HEADER) String userIdHeader,
+                                @Valid @RequestBody CreateOrderRequest request) {
+        return orderService.create(request, userIdHeader);
     }
 
     @GetMapping("/{id}")

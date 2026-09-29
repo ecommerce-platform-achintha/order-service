@@ -1,6 +1,8 @@
 package com.achintha.orderservice.integration;
 
+import static com.achintha.orderservice.security.GatewayUserHeaderFilter.USER_ID_HEADER;
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
 import static com.github.tomakehurst.wiremock.client.WireMock.okJson;
 import static com.github.tomakehurst.wiremock.client.WireMock.patch;
@@ -41,6 +43,7 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
+import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -76,6 +79,9 @@ class OrderEventsIntegrationTest {
         registry.add("spring.cloud.discovery.client.simple.instances.product-service[0].uri",
                 productService::baseUrl);
     }
+
+    /** X-User-Id the "Gateway" sets on writes; forwarded to product-service on inventory calls. */
+    private static final String GATEWAY_USER = "gateway-user-42";
 
     @Autowired
     private MockMvc mockMvc;
@@ -132,11 +138,11 @@ class OrderEventsIntegrationTest {
         stubInventoryUpdate(book, 200);
         String orderId = JsonPath.read(createOrder().andReturn().getResponse().getContentAsString(), "$.id");
 
-        mockMvc.perform(MockMvcRequestBuilders.patch("/api/orders/{id}/cancel", orderId))
+        mockMvc.perform(cancelRequest("/api/orders/{id}/cancel", orderId))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("CANCELLED"));
         // Second cancel is a 409: no status change, so no event
-        mockMvc.perform(MockMvcRequestBuilders.patch("/api/orders/{id}/cancel", orderId))
+        mockMvc.perform(cancelRequest("/api/orders/{id}/cancel", orderId))
                 .andExpect(status().isConflict());
 
         List<ConsumerRecord<String, String>> records = awaitEvents(orderId, 3);
@@ -216,6 +222,7 @@ class OrderEventsIntegrationTest {
 
     private ResultActions createOrder() throws Exception {
         return mockMvc.perform(MockMvcRequestBuilders.post("/api/orders")
+                .header(USER_ID_HEADER, GATEWAY_USER)
                 .contentType(MediaType.APPLICATION_JSON)
                 .content("""
                         {"userId": "%s", "items": [
@@ -231,8 +238,13 @@ class OrderEventsIntegrationTest {
     }
 
     private static void stubInventoryUpdate(UUID id, int status) {
-        productService.stubFor(patch(urlEqualTo("/api/products/" + id + "/inventory"))
+        productService.stubFor(patch(urlEqualTo("/api/products/" + id + "/inventory")).withHeader(USER_ID_HEADER, equalTo(GATEWAY_USER))
                 .willReturn(aResponse().withStatus(status).withHeader("Content-Type", "application/json")
                         .withBody("{\"productId\": \"%s\", \"quantityAvailable\": 0}".formatted(id))));
+    }
+
+    /** Writes need the header the Gateway sets after validating the JWT (see GatewayUserHeaderFilter). */
+    private static MockHttpServletRequestBuilder cancelRequest(String urlTemplate, Object orderId) {
+        return MockMvcRequestBuilders.patch(urlTemplate, orderId).header(USER_ID_HEADER, GATEWAY_USER);
     }
 }

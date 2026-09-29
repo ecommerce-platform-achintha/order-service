@@ -178,7 +178,37 @@ already fetched the topic's metadata, once the 10 s delivery timeout expires.
 
 ## API
 
-No authentication yet. Access control will be enforced by the API Gateway.
+Reads (`GET`) are public. Writes (`POST /api/orders`, `PATCH /api/orders/{id}/cancel`) must carry a non-blank
+`X-User-Id` header, which the API Gateway sets after it validates the caller's JWT. A write without it gets
+**401** with `{"error": "Authentication required"}`. It is never processed: nothing is saved, product-service is
+not called, and no event is published.
+
+### Gateway bypass guard: what it does and does not protect
+
+> **This is not authentication.** `GatewayUserHeaderFilter` only checks that the `X-User-Id` header is
+> present. It does not validate a JWT or a signature, and it does not check the value. Anyone who can reach
+> this service directly can send `X-User-Id: anything` and the write goes through.
+
+The check only stops accidental or naive direct calls, such as a write that someone sends to port 8083
+by mistake instead of through the Gateway. The real protection comes from **network isolation** in
+deployment: only the API Gateway should be able to reach order-service (private network, no published port,
+firewall or security-group rules). The Gateway must also **strip any client-supplied `X-User-Id`** and set
+its own. Otherwise a client can put its own header on a request that goes through the Gateway.
+Until both are in place, do not treat write access to this service as secured. This is the same guard, with the
+same caveat, as product-service's.
+
+Also note:
+
+- The guard matches on the HTTP method, not on a list of paths. Every request except `GET`, `HEAD` and `OPTIONS`
+  needs the header, so new write endpoints are covered automatically. When you call writes directly (curl,
+  Swagger UI), add the header yourself, as in the examples below.
+- **The header is not compared with the order's `userId`.** A caller with `X-User-Id: A` can place or cancel an
+  order for user B. Checking ownership needs a trusted identity (a verified JWT or a signed header), which this
+  presence check doesn't provide.
+- **order-service forwards the caller's `X-User-Id` to product-service** on the inventory calls
+  (`PATCH /api/products/{id}/inventory`), because product-service's own guard rejects writes without it.
+  Without forwarding, every stock decrement would get a 401, every order would end `FAILED`, and the 401s would
+  trip the circuit breaker. The product lookup is a `GET` and needs no header.
 
 | Method | Path | Description |
 |---|---|---|
@@ -221,6 +251,7 @@ Every error uses the same JSON shape (`fieldErrors` only for validation):
 
 | Status | When |
 |---|---|
+| 401 | A write without a non-blank `X-User-Id` header. Body is just `{"error": "Authentication required"}` (the filter answers before Spring MVC) |
 | 400 | Validation failure (missing `userId`, empty `items`, `quantity` < 1), malformed JSON, non-UUID id |
 | 404 | Unknown order, or an order line references a product that doesn't exist |
 | 409 | Not enough stock; cancelling a `CANCELLED`/`FAILED` order; concurrent modification of the same order |
@@ -229,34 +260,42 @@ Every error uses the same JSON shape (`fieldErrors` only for validation):
 ## Example: full create-order flow
 
 ```bash
+# Writes (on both services) need the header the Gateway would set (see "Gateway bypass guard" above)
+AUTH=(-H 'X-User-Id: local-dev')
+
 # 1. Create a category and product in product-service, and give it stock
-CATEGORY_ID=$(curl -s -X POST localhost:8082/api/categories -H 'Content-Type: application/json' \
+CATEGORY_ID=$(curl -s -X POST localhost:8082/api/categories "${AUTH[@]}" -H 'Content-Type: application/json' \
   -d '{"name": "Electronics"}' | jq -r .id)
-PRODUCT_ID=$(curl -s -X POST localhost:8082/api/products -H 'Content-Type: application/json' \
+PRODUCT_ID=$(curl -s -X POST localhost:8082/api/products "${AUTH[@]}" -H 'Content-Type: application/json' \
   -d "{\"name\": \"Gaming Laptop\", \"price\": 999.99, \"sku\": \"LAP-001\", \"categoryId\": \"$CATEGORY_ID\"}" | jq -r .id)
-curl -s -X PATCH localhost:8082/api/products/$PRODUCT_ID/inventory -H 'Content-Type: application/json' \
+curl -s -X PATCH localhost:8082/api/products/$PRODUCT_ID/inventory "${AUTH[@]}" -H 'Content-Type: application/json' \
   -d '{"delta": 10}'
 
-# 2. Place an order -> 201, status CONFIRMED, totalAmount 1999.98
 USER_ID=$(uuidgen)
-ORDER_ID=$(curl -s -X POST localhost:8083/api/orders -H 'Content-Type: application/json' \
+
+# Without the header, order writes are rejected -> 401 {"error":"Authentication required"}
+curl -i -X POST localhost:8083/api/orders -H 'Content-Type: application/json' \
+  -d "{\"userId\": \"$USER_ID\", \"items\": [{\"productId\": \"$PRODUCT_ID\", \"quantity\": 2}]}"
+
+# 2. Place an order -> 201, status CONFIRMED, totalAmount 1999.98
+ORDER_ID=$(curl -s -X POST localhost:8083/api/orders "${AUTH[@]}" -H 'Content-Type: application/json' \
   -d "{\"userId\": \"$USER_ID\", \"items\": [{\"productId\": \"$PRODUCT_ID\", \"quantity\": 2}]}" \
   | tee /dev/stderr | jq -r .id)
 
 # Stock in product-service went from 10 to 8
 curl -s localhost:8082/api/products/$PRODUCT_ID | jq .stock
 
-# 3. Fetch it, and list the user's orders
+# 3. Fetch it, and list the user's orders (reads need no header)
 curl -s localhost:8083/api/orders/$ORDER_ID | jq
 curl -s "localhost:8083/api/orders?userId=$USER_ID&page=0&size=10" | jq
 
 # 4. Ask for more than is in stock -> 409, nothing saved
-curl -s -X POST localhost:8083/api/orders -H 'Content-Type: application/json' \
+curl -s -X POST localhost:8083/api/orders "${AUTH[@]}" -H 'Content-Type: application/json' \
   -d "{\"userId\": \"$USER_ID\", \"items\": [{\"productId\": \"$PRODUCT_ID\", \"quantity\": 999}]}" | jq
 
 # 5. Cancel -> CANCELLED; cancelling again -> 409
-curl -s -X PATCH localhost:8083/api/orders/$ORDER_ID/cancel | jq .status
-curl -s -X PATCH localhost:8083/api/orders/$ORDER_ID/cancel | jq
+curl -s -X PATCH localhost:8083/api/orders/$ORDER_ID/cancel "${AUTH[@]}" | jq .status
+curl -s -X PATCH localhost:8083/api/orders/$ORDER_ID/cancel "${AUTH[@]}" | jq
 ```
 
 ## Observing the circuit breaker
@@ -290,9 +329,14 @@ mvn clean package   # unit + integration tests (Docker required)
 - `OrderTest`: unit tests for the total calculation (`Σ unitPrice × quantity`, BigDecimal precision) and the status
   rules (cancel allowed from `PENDING`/`CONFIRMED`, rejected from `CANCELLED`/`FAILED`; only `PENDING` can be
   confirmed or failed).
+- `GatewayUserHeaderFilterTest`: create and cancel return 401 with the JSON error, and never reach the service,
+  when `X-User-Id` is missing or blank. They pass through (with the header value handed on for forwarding) when
+  it is present. Both GETs work with or without the header (`@WebMvcTest` with a mocked service, no database).
 - `OrderFlowIntegrationTest`: real PostgreSQL through Testcontainers, with product-service stubbed by WireMock. The
   Feign client still goes through Spring Cloud LoadBalancer, which is pointed at WireMock. Covers:
   - successful creation (price snapshots, exact inventory deltas, get/list, cancel, double cancel → 409)
+  - writes without `X-User-Id` → 401 before any work; the WireMock inventory stubs only answer when the caller's
+    `X-User-Id` is forwarded, like product-service's guard
   - insufficient stock → 409, nothing saved, no decrement
   - product-service unreachable → 503 after exactly 2 attempts
   - breaker opening and then failing fast without calling product-service

@@ -1,8 +1,10 @@
 package com.achintha.orderservice.integration;
 
+import static com.achintha.orderservice.security.GatewayUserHeaderFilter.USER_ID_HEADER;
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.anyUrl;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalToJson;
+import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
 import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.okJson;
@@ -14,6 +16,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasSize;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -38,6 +41,7 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
+import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -83,6 +87,9 @@ class OrderFlowIntegrationTest {
         registry.add("spring.cloud.discovery.client.simple.instances.product-service[0].uri",
                 productService::baseUrl);
     }
+
+    /** X-User-Id the "Gateway" sets on writes; forwarded to product-service on inventory calls. */
+    private static final String GATEWAY_USER = "gateway-user-42";
 
     @Autowired
     private MockMvc mockMvc;
@@ -130,8 +137,10 @@ class OrderFlowIntegrationTest {
 
         // Stock was decremented by exactly the ordered quantities
         productService.verify(1, patchRequestedFor(urlEqualTo("/api/products/" + laptop + "/inventory"))
+                .withHeader(USER_ID_HEADER, equalTo(GATEWAY_USER))
                 .withRequestBody(equalToJson("{\"delta\": -2}")));
         productService.verify(1, patchRequestedFor(urlEqualTo("/api/products/" + book + "/inventory"))
+                .withHeader(USER_ID_HEADER, equalTo(GATEWAY_USER))
                 .withRequestBody(equalToJson("{\"delta\": -3}")));
 
         // Snapshots survive later price changes in product-service
@@ -148,10 +157,10 @@ class OrderFlowIntegrationTest {
                 .andExpect(jsonPath("$.content[0].id").value(orderId))
                 .andExpect(jsonPath("$.content[0].items", hasSize(2)));
 
-        mockMvc.perform(MockMvcRequestBuilders.patch("/api/orders/{id}/cancel", orderId))
+        mockMvc.perform(cancelRequest("/api/orders/{id}/cancel", orderId))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("CANCELLED"));
-        mockMvc.perform(MockMvcRequestBuilders.patch("/api/orders/{id}/cancel", orderId))
+        mockMvc.perform(cancelRequest("/api/orders/{id}/cancel", orderId))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.status").value(409))
                 .andExpect(jsonPath("$.message").value(containsString("CANCELLED to CANCELLED")));
@@ -168,7 +177,7 @@ class OrderFlowIntegrationTest {
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.status").value("CONFIRMED"))
                 .andReturn().getResponse().getContentAsString();
-        mockMvc.perform(MockMvcRequestBuilders.patch("/api/orders/{id}/cancel", (String) JsonPath.read(body, "$.id")))
+        mockMvc.perform(cancelRequest("/api/orders/{id}/cancel", (String) JsonPath.read(body, "$.id")))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("CANCELLED"));
         long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
@@ -176,6 +185,23 @@ class OrderFlowIntegrationTest {
         // 3 failed publishes, each bounded by max.block.ms, not Kafka's 60s default
         assertThat(elapsedMillis).isLessThan(5_000);
         assertThat(orderRepository.count()).isEqualTo(1);
+    }
+
+    @Test
+    void writesWithoutGatewayHeaderAreRejectedBeforeAnyWork() throws Exception {
+        UUID product = UUID.randomUUID();
+        stubProduct(product, "Gaming Laptop", "999.99", 5);
+
+        mockMvc.perform(MockMvcRequestBuilders.post("/api/orders")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(singleItemOrder(product, 1)))
+                .andExpect(status().isUnauthorized())
+                .andExpect(content().json("{\"error\":\"Authentication required\"}", true));
+        mockMvc.perform(MockMvcRequestBuilders.patch("/api/orders/{id}/cancel", UUID.randomUUID()))
+                .andExpect(status().isUnauthorized());
+
+        productService.verify(0, getRequestedFor(anyUrl()));
+        assertThat(orderRepository.count()).isZero();
     }
 
     @Test
@@ -254,7 +280,7 @@ class OrderFlowIntegrationTest {
     void marksOrderFailedWhenInventoryDecrementFails() throws Exception {
         UUID product = UUID.randomUUID();
         stubProduct(product, "Gaming Laptop", "999.99", 5);
-        productService.stubFor(patch(urlEqualTo("/api/products/" + product + "/inventory"))
+        productService.stubFor(patch(urlEqualTo("/api/products/" + product + "/inventory")).withHeader(USER_ID_HEADER, equalTo(GATEWAY_USER))
                 .willReturn(aResponse().withStatus(500)));
 
         String body = createOrder(singleItemOrder(product, 1))
@@ -297,6 +323,7 @@ class OrderFlowIntegrationTest {
 
     private ResultActions createOrder(String json) throws Exception {
         return mockMvc.perform(MockMvcRequestBuilders.post("/api/orders")
+                .header(USER_ID_HEADER, GATEWAY_USER)
                 .contentType(MediaType.APPLICATION_JSON)
                 .content(json));
     }
@@ -324,8 +351,13 @@ class OrderFlowIntegrationTest {
     }
 
     private static void stubInventoryUpdate(UUID id) {
-        productService.stubFor(patch(urlEqualTo("/api/products/" + id + "/inventory"))
+        productService.stubFor(patch(urlEqualTo("/api/products/" + id + "/inventory")).withHeader(USER_ID_HEADER, equalTo(GATEWAY_USER))
                 .willReturn(okJson("""
                         {"productId": "%s", "quantityAvailable": 0, "reservedQuantity": 0}""".formatted(id))));
+    }
+
+    /** Writes need the header the Gateway sets after validating the JWT (see GatewayUserHeaderFilter). */
+    private static MockHttpServletRequestBuilder cancelRequest(String urlTemplate, Object orderId) {
+        return MockMvcRequestBuilders.patch(urlTemplate, orderId).header(USER_ID_HEADER, GATEWAY_USER);
     }
 }
