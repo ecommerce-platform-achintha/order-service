@@ -1,0 +1,55 @@
+# Runs order-service + its PostgreSQL database.
+#
+# Config Server (8888), Eureka (8761) and product-service (8082) are expected to be running on the host
+# (see README); the container reaches Config Server and Eureka via host.docker.internal, and finds
+# product-service through Eureka.
+#
+# The database is published on host port 5434 (user-service uses 5432, product-service 5433), so all
+# stacks can run at the same time.
+#
+#   docker compose up --build        # service + DB
+#   docker compose up -d postgres    # DB only, then run the app with mvn spring-boot:run
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: order-service-postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME:-orderdb}
+      POSTGRES_USER: ${DB_USERNAME:-orderservice}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-orderservice}
+    ports:
+      - "${DB_PORT:-5434}:5432"
+    volumes:
+      - order-service-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  order-service:
+    build: .
+    image: order-service:latest
+    container_name: order-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-orderdb}
+      DB_USERNAME: ${DB_USERNAME:-orderservice}
+      DB_PASSWORD: ${DB_PASSWORD:-orderservice}
+      CONFIG_SERVER_URL: ${CONFIG_SERVER_URL:-http://host.docker.internal:8888}
+      EUREKA_URL: ${EUREKA_URL:-http://host.docker.internal:8761/eureka/}
+      # Register as localhost:8083 (the published port) rather than the container's internal IP
+      EUREKA_INSTANCE_PREFER_IP_ADDRESS: "false"
+      EUREKA_INSTANCE_HOSTNAME: localhost
+
+volumes:
+  order-service-pgdata:
