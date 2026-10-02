@@ -1,60 +1,82 @@
 package com.achintha.orderservice.order;
 
+import com.achintha.orderservice.common.Money;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.FetchType;
-import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.Id;
-import jakarta.persistence.Index;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
 import java.math.BigDecimal;
 import java.util.UUID;
-import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 
 /**
- * One line of an order. {@code productName} and {@code unitPrice} are copied from product-service when the order is
- * placed, so later catalog changes don't rewrite order history.
+ * One line of an order. Names and prices are snapshots taken from product-service at checkout ({@code listPrice},
+ * {@code discountAmount}, {@code unitPrice}); later catalog changes never alter a placed order. The merchant's quote
+ * may only lower {@code quantity} (0 removes the line); {@code orderedQuantity} keeps what the customer asked for.
  */
 @Entity
-@Table(name = "order_items", indexes = @Index(name = "idx_order_items_order_id", columnList = "order_id"))
+@Table(name = "order_items")
 @Getter
-@NoArgsConstructor(access = AccessLevel.PROTECTED)
+@Setter
+@NoArgsConstructor
 public class OrderItem {
 
     @Id
-    @GeneratedValue
     private UUID id;
 
-    @Setter(AccessLevel.PACKAGE)
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @JoinColumn(name = "order_id", nullable = false)
     private Order order;
 
-    @Column(name = "product_id", nullable = false)
-    private UUID productId;
+    @Column(nullable = false)
+    private int position;
 
-    @Column(name = "product_name", nullable = false, length = 200)
-    private String productName;
+    @Column(name = "variant_id", nullable = false)
+    private UUID variantId;
 
-    @Column(name = "unit_price", nullable = false, precision = 12, scale = 2)
-    private BigDecimal unitPrice;
+    @Column(name = "item_public_id", nullable = false, length = 20)
+    private String itemPublicId;
+
+    @Column(name = "variant_public_id", nullable = false, length = 20)
+    private String variantPublicId;
+
+    @Column(nullable = false, length = 200)
+    private String name;
+
+    @Column(name = "variant_name", length = 200)
+    private String variantName;
+
+    @Column(nullable = false, length = 64)
+    private String sku;
+
+    /** JSON object of option name to value (e.g. {"Size":"M"}). */
+    @Column(columnDefinition = "text")
+    private String attributes;
+
+    @Column(name = "ordered_quantity", nullable = false)
+    private int orderedQuantity;
 
     @Column(nullable = false)
     private int quantity;
 
-    public OrderItem(UUID productId, String productName, BigDecimal unitPrice, int quantity) {
-        this.productId = productId;
-        this.productName = productName;
-        this.unitPrice = unitPrice;
-        this.quantity = quantity;
-    }
+    @Column(name = "list_price", nullable = false, precision = 12, scale = 2)
+    private BigDecimal listPrice;
+
+    @Column(name = "discount_amount", nullable = false, precision = 12, scale = 2)
+    private BigDecimal discountAmount;
+
+    @Column(name = "unit_price", nullable = false, precision = 12, scale = 2)
+    private BigDecimal unitPrice;
+
+    @Column(name = "cod_allowed", nullable = false)
+    private boolean codAllowed;
 
     public BigDecimal lineTotal() {
-        return unitPrice.multiply(BigDecimal.valueOf(quantity));
+        return Money.times(unitPrice, quantity);
     }
 }

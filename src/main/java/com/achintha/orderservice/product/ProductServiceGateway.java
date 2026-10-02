@@ -1,130 +1,121 @@
 package com.achintha.orderservice.product;
 
+import com.achintha.orderservice.client.RemoteCalls;
+import com.achintha.orderservice.exception.ConflictException;
+import com.achintha.orderservice.exception.ErrorCode;
 import com.achintha.orderservice.exception.InsufficientStockException;
 import com.achintha.orderservice.exception.NotFoundException;
-import com.achintha.orderservice.exception.ProductServiceUnavailableException;
+import com.achintha.orderservice.product.ProductDtos.AdjustRequest;
+import com.achintha.orderservice.product.ProductDtos.LineRequest;
+import com.achintha.orderservice.product.ProductDtos.QuoteItem;
+import com.achintha.orderservice.product.ProductDtos.QuoteRequest;
+import com.achintha.orderservice.product.ProductDtos.QuoteResponse;
+import com.achintha.orderservice.product.ProductDtos.ReservationResponse;
+import com.achintha.orderservice.product.ProductDtos.ReserveRequest;
+import com.achintha.orderservice.security.ServiceTokenProvider;
 import feign.FeignException;
-import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
-import io.github.resilience4j.circuitbreaker.CircuitBreaker;
-import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
-import io.github.resilience4j.retry.Retry;
-import io.github.resilience4j.retry.RetryRegistry;
-import io.github.resilience4j.timelimiter.TimeLimiter;
-import io.github.resilience4j.timelimiter.TimeLimiterRegistry;
-import jakarta.annotation.PreDestroy;
+import java.time.Instant;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.Callable;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeoutException;
-import java.util.function.Supplier;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 import org.springframework.stereotype.Component;
 
 /**
- * Resilient access to product-service: every call runs as Retry(CircuitBreaker(TimeLimiter(feign call))), so each
- * attempt has its own timeout and is counted by the breaker. All settings come from the named instances under
- * {@code resilience4j.*} in application.yml.
+ * Resilient access to product-service ({@link RemoteCalls}, instance {@code productService}, the same
+ * breaker/retry/time-limiter pattern as before) with a service token.
  *
- * <p>Business answers from product-service (404 unknown product, 409 not enough stock) pass through as
- * {@link NotFoundException} / {@link InsufficientStockException}; the yml config tells the breaker and the retries
- * to ignore them. Anything else (down, timeout, 5xx, breaker open) ends in {@link ProductServiceUnavailableException}.
+ * <p>Business answers pass through as typed errors: {@code INSUFFICIENT_STOCK} as {@link InsufficientStockException},
+ * unknown or unsellable variants as {@code VARIANT_NOT_AVAILABLE}. Reservation calls are idempotent per
+ * {@code orderRef}, so retrying them is always safe.
  */
 @Component
 public class ProductServiceGateway {
 
-    /** One breaker for both calls: they hit the same service, so either failing says product-service is unhealthy. */
-    public static final String CIRCUIT_BREAKER = "productService";
-    public static final String LOOKUP_RETRY = "productLookup";
-    /** Retries only when the request never reached product-service, since a decrement is not idempotent. */
-    public static final String INVENTORY_RETRY = "inventoryUpdate";
-    public static final String TIME_LIMITER = "productService";
+    public static final String INSTANCE = "productService";
+    private static final String SERVICE = "Product service";
 
     private final ProductClient client;
-    private final CircuitBreaker circuitBreaker;
-    private final Retry lookupRetry;
-    private final Retry inventoryRetry;
-    private final TimeLimiter timeLimiter;
-    // TimeLimiter needs a future to time out; virtual threads keep blocking Feign calls cheap
-    private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+    private final RemoteCalls remote;
+    private final ServiceTokenProvider serviceTokens;
 
-    public ProductServiceGateway(ProductClient client, CircuitBreakerRegistry circuitBreakerRegistry,
-                                 RetryRegistry retryRegistry, TimeLimiterRegistry timeLimiterRegistry) {
+    public ProductServiceGateway(ProductClient client, RemoteCalls remote, ServiceTokenProvider serviceTokens) {
         this.client = client;
-        this.circuitBreaker = circuitBreakerRegistry.circuitBreaker(CIRCUIT_BREAKER);
-        this.lookupRetry = retryRegistry.retry(LOOKUP_RETRY);
-        this.inventoryRetry = retryRegistry.retry(INVENTORY_RETRY);
-        this.timeLimiter = timeLimiterRegistry.timeLimiter(TIME_LIMITER);
+        this.remote = remote;
+        this.serviceTokens = serviceTokens;
     }
 
-    /** Current name, price and available stock of a product. */
-    public ProductResponse getProduct(UUID productId) {
-        return call(lookupRetry, "look up product " + productId, () -> {
-            try {
-                return client.getProduct(productId);
-            } catch (FeignException.NotFound e) {
-                throw new NotFoundException("Product not found: " + productId);
-            }
-        });
+    /** Live price, discount, stock and availability, keyed by variant UUID. Unknown variants are left out. */
+    public Map<UUID, QuoteItem> quote(Collection<UUID> variantIds) {
+        if (variantIds.isEmpty()) {
+            return Map.of();
+        }
+        QuoteResponse response = call("price the cart",
+                bearer -> client.quote(new QuoteRequest(List.copyOf(variantIds), null), bearer));
+        return response.items().stream().collect(Collectors.toMap(QuoteItem::variantId, Function.identity()));
     }
 
-    /**
-     * Adds {@code delta} (negative to take stock out) to the product's available quantity, on behalf of the user in
-     * {@code userIdHeader} (the X-User-Id the Gateway set on the incoming request). Passed explicitly because the
-     * Feign call runs on another thread, where the incoming request isn't available.
-     */
-    public InventoryResponse adjustInventory(UUID productId, int delta, String userIdHeader) {
-        return call(inventoryRetry, "adjust inventory of product " + productId, () -> {
-            try {
-                return client.adjustInventory(productId, userIdHeader, new AdjustInventoryRequest(delta));
-            } catch (FeignException.NotFound e) {
-                throw new NotFoundException("Product not found: " + productId);
-            } catch (FeignException.Conflict e) {
-                throw new InsufficientStockException("Not enough stock left for product " + productId);
-            }
-        });
+    /** One variant by its public id; 404 {@code VARIANT_NOT_AVAILABLE} if it does not exist. */
+    public QuoteItem quoteByPublicId(String variantPublicId) {
+        QuoteResponse response = call("look up the variant",
+                bearer -> client.quote(new QuoteRequest(null, List.of(variantPublicId)), bearer));
+        return response.items().stream().filter(i -> variantPublicId.equals(i.variantPublicId())).findFirst()
+                .orElseThrow(
+                () -> new NotFoundException(ErrorCode.VARIANT_NOT_AVAILABLE, "Variant not found"));
     }
 
-    private <T> T call(Retry retry, String action, Supplier<T> feignCall) {
-        Callable<T> timed = TimeLimiter.decorateFutureSupplier(timeLimiter,
-                () -> CompletableFuture.supplyAsync(feignCall, executor));
-        Callable<T> guarded = CircuitBreaker.decorateCallable(circuitBreaker, timed);
-        Callable<T> retried = Retry.decorateCallable(retry, guarded);
+    /** Holds stock for an order: all lines or none. */
+    public ReservationResponse reserve(String orderRef, Instant expiresAt, List<LineRequest> lines) {
+        return call("reserve stock", bearer -> client.reserve(new ReserveRequest(orderRef, expiresAt, lines), bearer));
+    }
+
+    /** Keeps only {@code lines} (reductions only) and moves the expiry. */
+    public ReservationResponse adjust(String orderRef, List<LineRequest> lines, Instant expiresAt) {
+        return call("adjust the stock hold", bearer -> client.adjust(orderRef, new AdjustRequest(lines, expiresAt), bearer));
+    }
+
+    public ReservationResponse commit(String orderRef) {
+        return call("commit the stock hold", bearer -> client.commit(orderRef, bearer));
+    }
+
+    /** Returns held units to stock. An unknown hold counts as released (nothing to give back). */
+    public void release(String orderRef) {
         try {
-            return retried.call();
-        } catch (Exception e) {
-            throw fallback(action, unwrap(e));
+            call("release the stock hold", bearer -> client.release(orderRef, bearer));
+        } catch (NotFoundException e) {
+            // no hold was ever placed for this order
         }
     }
 
-    /** Rethrows business errors as they are; turns everything else into a clear 503, never fabricated data. */
-    private static RuntimeException fallback(String action, Throwable failure) {
-        if (failure instanceof NotFoundException || failure instanceof InsufficientStockException) {
-            return (RuntimeException) failure;
-        }
-        String reason = switch (failure) {
-            case CallNotPermittedException ignored -> "circuit breaker is open";
-            case TimeoutException ignored -> "request timed out";
-            default -> "request failed";
+    private <T> T call(String action, Function<String, T> feignCall) {
+        return remote.call(INSTANCE, SERVICE, action, () -> {
+            try {
+                return feignCall.apply("Bearer " + serviceTokens.token());
+            } catch (FeignException.Unauthorized e) {
+                serviceTokens.invalidate();
+                throw e;
+            } catch (FeignException.NotFound e) {
+                throw new NotFoundException(ErrorCode.VARIANT_NOT_AVAILABLE, "Not found in product-service");
+            } catch (FeignException.Conflict | FeignException.BadRequest e) {
+                throw translate(e);
+            }
+        });
+    }
+
+    private static RuntimeException translate(FeignException e) {
+        String code = RemoteCalls.errorCode(e).orElse("");
+        return switch (code) {
+            case "INSUFFICIENT_STOCK" -> new InsufficientStockException("Not enough stock for one of the items");
+            case "VARIANT_NOT_AVAILABLE" -> new ConflictException(ErrorCode.VARIANT_NOT_AVAILABLE,
+                    "One of the items is no longer available");
+            case "RESERVATION_RELEASED", "RESERVATION_COMMITTED", "RESERVATION_CONFLICT",
+                 "RESERVATION_ADJUST_NOT_ALLOWED" -> new ConflictException(ErrorCode.INVALID_ORDER_STATE,
+                    "The order's stock hold cannot be changed (" + code + ")");
+            // A 400 we caused (e.g. expiry not in the future) is not product-service's fault: surface as a conflict
+            default -> new ConflictException(ErrorCode.INVALID_ORDER_STATE,
+                    "product-service refused the request (" + (code.isEmpty() ? e.status() : code) + ")");
         };
-        return new ProductServiceUnavailableException(
-                "Product service is unavailable (" + reason + "): could not " + action + ". Try again later.",
-                failure);
-    }
-
-    private static Throwable unwrap(Throwable e) {
-        Throwable t = e;
-        while ((t instanceof ExecutionException || t instanceof CompletionException)
-                && t.getCause() != null) {
-            t = t.getCause();
-        }
-        return t;
-    }
-
-    @PreDestroy
-    void shutdown() {
-        executor.shutdownNow();
     }
 }

@@ -7,62 +7,122 @@ spring:
   config:
     # "optional:" lets the service start even when the Config Server is down.
     # Override with CONFIG_SERVER_URL, e.g. inside Docker where localhost is the container.
+    # The service client secret comes from the Config Server or the environment; there is no local default for it.
     import: optional:configserver:${CONFIG_SERVER_URL:http://localhost:8888}
   datasource:
-    # Defaults match docker-compose.yml (orderdb on host port 5434), next to user-service (5432) and product-service (5433).
+    # Defaults match docker-compose.yml (orderdb on host port 5434), next to user-service (5432),
+    # product-service (5433) and store-service (5435).
     url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5434}/${DB_NAME:orderdb}
     username: ${DB_USERNAME:orderservice}
     password: ${DB_PASSWORD:orderservice}
   jpa:
-    # Temporary: schema managed by Hibernate until Flyway/Liquibase migrations are introduced.
+    # Schema is owned by Flyway (src/main/resources/db/migration); Hibernate only checks it matches the entities.
     hibernate:
-      ddl-auto: update
+      ddl-auto: validate
     open-in-view: false
-  data:
-    web:
-      pageable:
-        max-page-size: 100
+  flyway:
+    enabled: true
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     producer:
+      # The outbox relay sends the stored JSON payload as-is, keyed by the order's UUID
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
       acks: all
       properties:
-        # Plain JSON with its own "eventType" discriminator; no Java class name header for consumers to depend on
-        spring.json.add.type.headers: false
-        # Events are notifications, not prerequisites: if the broker is unreachable, send() gives up after 1s
-        # (Kafka's default is 60s, which would stall the order request) and delivery fails after 10s, not 2min.
-        max.block.ms: 1000
+        enable.idempotence: true
+        max.block.ms: 5000
         request.timeout.ms: 5000
         delivery.timeout.ms: 10000
+    consumer:
+      # Payloads are plain JSON with an "eventType" field; parsed by the listeners themselves
+      group-id: order-service
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
   cloud:
     openfeign:
       client:
         config:
-          product-service:
+          default:
             connect-timeout: 1000
             # Backstop only: the 3s TimeLimiter below normally fires first
             read-timeout: 4000
 
-order-service:
+# Local fallbacks mirroring config-repo (application.yml + order-service.yml). The Config Server wins when reachable.
+security:
+  jwt:
+    issuer: ${JWT_ISSUER:user-service}
+    audience: ${JWT_AUDIENCE:marketplace}
+    jwks-uri: ${JWKS_URI:http://localhost:8081/.well-known/jwks.json}
+    clock-skew-seconds: ${JWT_CLOCK_SKEW_SECONDS:30}
+  internal:
+    # Client credentials for user-service's POST /internal/auth/service-token. The secret comes from the Config
+    # Server (SERVICE_CLIENT_SECRET_ORDER, same value as in user-service); no default on purpose.
+    client-id: ${spring.application.name}
+    client-secret: ${SERVICE_CLIENT_SECRET_ORDER:}
+    # A cached service token is renewed this long before it expires
+    refresh-before-expiry: PT30S
+  state-cache:
+    # Token-version cache of the SecurityStateFilter (fed by user-events, filled from user-service on a miss)
+    max-size: 100000
+    ttl: PT10M
+
+app:
+  timezone: ${APP_TIMEZONE:Asia/Colombo}
   kafka:
-    # All order status changes go to this one topic, keyed by orderId
-    order-events-topic: order-events
+    topics:
+      user-events: ${KAFKA_TOPIC_USER_EVENTS:user-events}
+      store-events: ${KAFKA_TOPIC_STORE_EVENTS:store-events}
+      product-events: ${KAFKA_TOPIC_PRODUCT_EVENTS:product-events}
+      order-events: ${KAFKA_TOPIC_ORDER_EVENTS:order-events}
+  crypto:
+    # AES-256-GCM key for the customer's depositing account number (base64 of 32 bytes, `openssl rand -base64 32`).
+    # No default: startup fails without it.
+    payment-account-key: ${PAYMENT_ACCOUNT_ENCRYPTION_KEY:}
+  scheduling:
+    # Turns all @Scheduled jobs off (tests trigger the jobs directly)
+    enabled: true
+    shedlock:
+      enabled: ${SHEDLOCK_ENABLED:true}
+      default-lock-at-most-for: PT10M
+    # OrderDeadlineScheduler: picks due orders (FOR UPDATE SKIP LOCKED) in batches
+    order-deadlines:
+      interval: PT1M
+      batch-size: 100
+    # Expired Idempotency-Key rows (kept 24 h)
+    idempotency-cleanup:
+      interval: PT1H
+  outbox:
+    relay-interval: PT1S
+    batch-size: 100
+  platform:
+    # Platform settings (GET /internal/settings) and holidays (GET /internal/holidays) from store-service are
+    # cached this long; SettingsChanged / HolidaysChanged drop the cache at once. If store-service is down, the
+    # last known values keep being used.
+    settings-ttl: PT60S
+    holidays-ttl: PT1H
+  orders:
+    # How long an Idempotency-Key result is kept and replayed
+    idempotency-ttl: PT24H
+    max-cart-lines: 100
+    max-line-quantity: 100
+    # When a payment-verification deadline is missed the order stays open: the stock hold is extended this much
+    # so product-service's safety net does not release it
+    overdue-hold-extension: P30D
+  ports:
+    # Mock adapters for the external providers (log only, always succeed). Set to another value once a real
+    # adapter exists.
+    notification: mock
+    image-storage: mock
+    image-base-url: https://images.example.invalid/
 
-eureka:
-  client:
-    service-url:
-      defaultZone: ${EUREKA_URL:http://localhost:8761/eureka/}
-  instance:
-    prefer-ip-address: true
-
-# Resilience for calls to product-service (see ProductServiceGateway). Each call runs as
-# Retry(CircuitBreaker(TimeLimiter(call))): every attempt gets its own timeout and is counted by the breaker.
+# Resilience for calls to product-, store- and user-service (see RemoteCall). Each call runs as
+# Retry(CircuitBreaker(TimeLimiter(feign call))): every attempt gets its own timeout and is counted by the breaker.
 resilience4j:
   circuitbreaker:
-    instances:
-      productService:
+    configs:
+      default:
         sliding-window-type: COUNT_BASED
         sliding-window-size: 10
         minimum-number-of-calls: 5
@@ -72,41 +132,63 @@ resilience4j:
         wait-duration-in-open-state: 15s
         permitted-number-of-calls-in-half-open-state: 3
         automatic-transition-from-open-to-half-open-enabled: true
-        # product-service answered, just "no": not a sign it is unhealthy
+        # The service answered, just "no" (404, 409, 400): not a sign it is unhealthy
         ignore-exceptions:
-          - com.achintha.orderservice.exception.NotFoundException
-          - com.achintha.orderservice.exception.InsufficientStockException
-  retry:
-    instances:
-      productLookup:
-        max-attempts: 2
-        wait-duration: 300ms
-        ignore-exceptions:
-          - com.achintha.orderservice.exception.NotFoundException
-          - com.achintha.orderservice.exception.InsufficientStockException
-          - io.github.resilience4j.circuitbreaker.CallNotPermittedException
-      inventoryUpdate:
-        max-attempts: 2
-        wait-duration: 300ms
-        # A decrement isn't idempotent: only retry when the request never reached product-service
-        retry-exception-predicate: com.achintha.orderservice.product.ConnectFailurePredicate
-        ignore-exceptions:
-          - com.achintha.orderservice.exception.NotFoundException
-          - com.achintha.orderservice.exception.InsufficientStockException
-          - io.github.resilience4j.circuitbreaker.CallNotPermittedException
-  timelimiter:
+          - com.achintha.orderservice.exception.ApiException
     instances:
       productService:
+        base-config: default
+      storeService:
+        base-config: default
+      userService:
+        base-config: default
+  retry:
+    configs:
+      default:
+        max-attempts: 2
+        wait-duration: 300ms
+        ignore-exceptions:
+          - com.achintha.orderservice.exception.ApiException
+          - io.github.resilience4j.circuitbreaker.CallNotPermittedException
+    instances:
+      # Every product-service call is idempotent (quote is a read; reservations are idempotent per orderRef)
+      productService:
+        base-config: default
+      storeService:
+        base-config: default
+      userService:
+        base-config: default
+  timelimiter:
+    configs:
+      default:
         timeout-duration: 3s
         cancel-running-future: true
+    instances:
+      productService:
+        base-config: default
+      storeService:
+        base-config: default
+      userService:
+        base-config: default
+
+eureka:
+  client:
+    service-url:
+      defaultZone: ${EUREKA_URL:http://localhost:8761/eureka/}
+  instance:
+    prefer-ip-address: true
 
 management:
   endpoints:
     web:
       exposure:
-        # circuitbreakers / circuitbreakerevents show the product-service breaker's state and recent calls
-        include: health,info,circuitbreakers,circuitbreakerevents
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
 
 springdoc:
   swagger-ui:
     path: /swagger-ui.html
+  # Internal (service-to-service) endpoints are never part of the public API docs
+  paths-to-exclude: /internal/**

@@ -1,8 +1,11 @@
 package com.achintha.orderservice.exception;
 
-public class ConflictException extends RuntimeException {
+import org.springframework.http.HttpStatus;
 
-    public ConflictException(String message) {
-        super(message);
+/** 409: the request is valid but conflicts with the current state. */
+public class ConflictException extends ApiException {
+
+    public ConflictException(ErrorCode code, String message) {
+        super(HttpStatus.CONFLICT, code, message);
     }
 }

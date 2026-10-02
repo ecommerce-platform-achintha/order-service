@@ -15,12 +15,14 @@
     <artifactId>order-service</artifactId>
     <version>0.0.1-SNAPSHOT</version>
     <name>order-service</name>
-    <description>Order placement and lifecycle service</description>
+    <description>Cart, checkout, orders and their state machine, payments, scores and complaints</description>
 
     <properties>
         <java.version>25</java.version>
         <spring-cloud.version>2025.1.3</spring-cloud.version>
         <springdoc.version>3.0.3</springdoc.version>
+        <shedlock.version>7.10.1</shedlock.version>
+        <owasp-html-sanitizer.version>20260924.2</owasp-html-sanitizer.version>
         <wiremock.version>3.13.2</wiremock.version>
     </properties>
 
@@ -31,7 +33,45 @@
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+        </dependency>
+        <!-- Validates the RS256 access tokens issued by user-service against its JWKS -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-flyway</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-database-postgresql</artifactId>
+        </dependency>
+        <!-- Security-state, settings and holiday caches -->
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+        </dependency>
+        <!-- Scheduler locks (one replica runs each job), stored in the "shedlock" table -->
+        <dependency>
+            <groupId>net.javacrumbs.shedlock</groupId>
+            <artifactId>shedlock-spring</artifactId>
+            <version>${shedlock.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>net.javacrumbs.shedlock</groupId>
+            <artifactId>shedlock-provider-jdbc-template</artifactId>
+            <version>${shedlock.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.googlecode.owasp-java-html-sanitizer</groupId>
+            <artifactId>owasp-java-html-sanitizer</artifactId>
+            <version>${owasp-html-sanitizer.version}</version>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -54,7 +94,7 @@
             <artifactId>spring-cloud-starter-openfeign</artifactId>
         </dependency>
         <dependency>
-            <!-- Feign's default HttpURLConnection client can't send PATCH (used for the inventory call) -->
+            <!-- Apache HttpClient 5 for Feign (connection pooling; automatic retries disabled in FeignConfig) -->
             <groupId>io.github.openfeign</groupId>
             <artifactId>feign-hc5</artifactId>
         </dependency>

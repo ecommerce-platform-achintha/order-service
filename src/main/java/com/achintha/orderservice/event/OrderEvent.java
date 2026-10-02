@@ -1,34 +1,65 @@
 package com.achintha.orderservice.event;
 
-import com.achintha.orderservice.order.Order;
-import com.achintha.orderservice.order.OrderStatus;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
 /**
- * Payload published to the order-events topic on every order status change. Items carry only productId and
- * quantity; consumers that need names or prices can fetch the order.
+ * JSON payload of every {@code order-events} message, keyed by {@code orderId}. Fields that do not apply to an event
+ * are omitted. No PII (no address, phone or account numbers) is published.
+ *
+ * @param status          the order's status after the change
+ * @param previousStatus  the status before it
+ * @param terminalStatus  {@code OrderCancelled}: which terminal state (e.g. {@code EXPIRED_MERCHANT})
+ * @param reason          reason code or text of a rejection, cancellation, failure or admin resolution
+ * @param placedAt        when the order was placed (store-service measures the merchant's response time)
+ * @param quoteRevision   {@code OrderQuoted}: 1 for the first quote, higher for re-quotes
+ * @param merchantPenalty penalty hint for store-service: {@code RESPONSE_TIMEOUT}, {@code LATE_SHIPMENT},
+ *                        {@code LATE_VERIFICATION} or {@code COMPLAINT_UPHELD}
+ * @param customerPenalty the customer score change applied here, for information: {@code DECLINED} or
+ *                        {@code EXPIRED}
+ * @param lines           the order's lines at the time (variant ids and quantities; quantity 0 = removed)
+ * @param decision        {@code ComplaintDecided}: {@code UPHELD} or {@code DISMISSED}
+ * @param resolution      {@code CLOSED_BY_ADMIN} / admin {@code FORCE_COMPLETE}: the admin action
  */
+@JsonInclude(JsonInclude.Include.NON_NULL)
 public record OrderEvent(
+        UUID eventId,
         OrderEventType eventType,
+        Instant occurredAt,
         UUID orderId,
-        UUID userId,
-        OrderStatus status,
-        BigDecimal totalAmount,
-        List<Item> items,
-        Instant timestamp) {
+        String orderPublicId,
+        String checkoutPublicId,
+        UUID storeId,
+        String storePublicId,
+        UUID customerId,
+        String customerPublicId,
+        String status,
+        String previousStatus,
+        String terminalStatus,
+        String reason,
+        String paymentMethod,
+        BigDecimal itemsTotal,
+        BigDecimal courierCharge,
+        BigDecimal otherChargesTotal,
+        BigDecimal quoteDiscount,
+        BigDecimal grandTotal,
+        Instant placedAt,
+        Integer quoteRevision,
+        String merchantPenalty,
+        String customerPenalty,
+        List<Line> lines,
+        String courierCode,
+        String trackingNumber,
+        String deliveryFailureType,
+        String complaintPublicId,
+        String decision,
+        String flaggedReferencePublicId,
+        String resolution) {
 
-    public record Item(UUID productId, int quantity) {
-    }
-
-    /** Snapshot of the order as it is now; call it where the order's items are still loaded. */
-    public static OrderEvent of(OrderEventType type, Order order) {
-        List<Item> items = order.getItems().stream()
-                .map(item -> new Item(item.getProductId(), item.getQuantity()))
-                .toList();
-        return new OrderEvent(type, order.getId(), order.getUserId(), order.getStatus(), order.getTotalAmount(),
-                items, Instant.now());
+    /** One order line: variant UUID and publicId, quantity. */
+    public record Line(UUID variantId, String variantPublicId, String itemPublicId, int quantity) {
     }
 }

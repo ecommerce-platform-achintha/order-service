@@ -1,16 +1,11 @@
 package com.achintha.orderservice.exception;
 
-import java.util.UUID;
+import org.springframework.http.HttpStatus;
 
-/** Requested quantity exceeds what product-service reports as available. */
-public class InsufficientStockException extends ConflictException {
-
-    public InsufficientStockException(UUID productId, int requested, int available) {
-        super("Insufficient stock for product " + productId + ": requested " + requested + ", available "
-                + available);
-    }
+/** 409: product-service cannot hold the requested quantity. */
+public class InsufficientStockException extends ApiException {
 
     public InsufficientStockException(String message) {
-        super(message);
+        super(HttpStatus.CONFLICT, ErrorCode.INSUFFICIENT_STOCK, message);
     }
 }
