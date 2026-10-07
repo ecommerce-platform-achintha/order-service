@@ -5,6 +5,7 @@ import java.time.LocalDate;
 import java.util.List;
 import java.util.UUID;
 import org.springframework.cloud.openfeign.FeignClient;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.HttpHeaders;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -37,8 +38,10 @@ public interface StoreServiceClient {
     @GetMapping("/internal/settings")
     List<Setting> settings(@RequestHeader(HttpHeaders.AUTHORIZATION) String bearer);
 
+    /** Dates are sent as ISO yyyy-MM-dd; without @DateTimeFormat Feign would format them with the JVM locale. */
     @GetMapping("/internal/holidays")
-    List<Holiday> holidays(@RequestParam("from") LocalDate from, @RequestParam("to") LocalDate to,
+    List<Holiday> holidays(@RequestParam("from") @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+                           @RequestParam("to") @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
                            @RequestHeader(HttpHeaders.AUTHORIZATION) String bearer);
 
     /** @param visible {@code published && acceptingOrders}: the store takes new orders right now */
