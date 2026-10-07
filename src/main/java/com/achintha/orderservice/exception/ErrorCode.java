@@ -18,6 +18,7 @@ public enum ErrorCode {
     UNAUTHORIZED,
     ACCESS_DENIED,
     TOKEN_REVOKED,
+    PASSWORD_CHANGE_REQUIRED,
 
     // Idempotency
     IDEMPOTENCY_KEY_REQUIRED,

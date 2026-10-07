@@ -53,9 +53,15 @@ public class SecurityStateFilter extends OncePerRequestFilter {
         Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
         if (authentication instanceof JwtAuthenticationToken jwtAuth && isUserToken(jwtAuth.getToken())) {
             ApiException rejection = check(jwtAuth.getToken(), request);
+            if (rejection == null) {
+                // Only after the version check, so a revoked token is still 401 TOKEN_REVOKED
+                rejection = passwordChangeRequired(jwtAuth.getToken());
+            }
             if (rejection != null) {
                 SecurityContextHolder.clearContext();
-                response.setHeader(HttpHeaders.WWW_AUTHENTICATE, "Bearer error=\"invalid_token\"");
+                if (rejection.code() == ErrorCode.TOKEN_REVOKED) {
+                    response.setHeader(HttpHeaders.WWW_AUTHENTICATE, "Bearer error=\"invalid_token\"");
+                }
                 resolver.resolveException(request, response, null, rejection);
                 return;
             }
@@ -96,5 +102,17 @@ public class SecurityStateFilter extends OncePerRequestFilter {
 
     private static ApiException revoked() {
         return ApiException.unauthorized(ErrorCode.TOKEN_REVOKED, "This token has been revoked; sign in again");
+    }
+
+    /**
+     * A token issued for a temporary password ({@code mcp=true}) is only good for user-service's change-password and
+     * logout; everything here answers 403 until the password is changed and a new token is issued.
+     */
+    private static ApiException passwordChangeRequired(Jwt jwt) {
+        if (Boolean.TRUE.equals(jwt.getClaim(TokenClaims.MUST_CHANGE_PASSWORD))) {
+            return ApiException.forbidden(ErrorCode.PASSWORD_CHANGE_REQUIRED,
+                    "You must change your password before continuing (POST /api/auth/change-password)");
+        }
+        return null;
     }
 }

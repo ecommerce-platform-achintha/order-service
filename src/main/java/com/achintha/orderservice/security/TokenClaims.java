@@ -13,6 +13,8 @@ public final class TokenClaims {
     public static final String PERMISSIONS = "perms";
     /** Token version; tokens older than the user's current version are rejected. */
     public static final String TOKEN_VERSION = "tv";
+    /** Present and true only while the user must still change a temporary password. */
+    public static final String MUST_CHANGE_PASSWORD = "mcp";
     /** Service tokens only: the calling service's client id. */
     public static final String SERVICE = "svc";
 
